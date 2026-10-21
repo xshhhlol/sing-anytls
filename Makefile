@@ -1,4 +1,4 @@
-.PHONY: fmt lint lint_install test
+.PHONY: fmt lint lint_install test realclient measure
 
 export GOTOOLCHAIN := local
 unexport GOROOT
@@ -6,6 +6,7 @@ unexport GOROOT
 fmt:
 	@golangci-lint fmt
 	@cd test && golangci-lint fmt
+	@cd test/realclient && golangci-lint fmt
 
 lint:
 	GOOS=linux golangci-lint run ./...
@@ -13,6 +14,7 @@ lint:
 	GOOS=windows golangci-lint run ./...
 	GOOS=darwin golangci-lint run ./...
 	cd test && golangci-lint run ./...
+	cd test/realclient && golangci-lint run ./...
 #	GOOS=freebsd golangci-lint run ./...
 
 lint_install:
@@ -21,3 +23,14 @@ lint_install:
 test:
 	go test -race ./...
 	cd test && go test -race ./...
+	cd test/mihomo && go test -race ./...
+	cd test/realclient && go test -race ./...
+
+# Real client binaries are built from ../sing-box_mod and the module proxy;
+# see test/realclient/README.md.
+realclient:
+	cd test/realclient && ./build.sh
+	cd test/realclient && REALCLIENT=1 go test -count=1 -v -run 'TestClientMatrix|TestFallbackProbes' .
+
+measure:
+	cd test/realclient && REALCLIENT_MEASURE=1 REALCLIENT_OUT=out go test -count=1 -timeout 60m -v -run TestMeasure .

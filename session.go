@@ -33,6 +33,10 @@ type session struct {
 	pendingLen  int
 	sendPadding bool
 	packetCount uint32
+	downlink    *downlinkShaper
+	// The read loop requests a new shaping window without waiting on a blocked
+	// writer. Only the writer mutates the shaper and its lifetime byte budget.
+	downlinkRearm atomic.Bool
 
 	streamAccess sync.RWMutex
 	streams      map[uint32]*stream
@@ -87,6 +91,7 @@ func newClientSession(client *Client, conn net.Conn) *session {
 
 func newServerSession(ctx context.Context, service *Service, conn net.Conn, source M.Socksaddr) *session {
 	return &session{
+		downlink:       newDownlinkShaper(service.trafficShaping),
 		conn:           conn,
 		reader:         std_bufio.NewReaderSize(conn, sessionReadBufferSize),
 		padding:        &service.padding,
@@ -321,6 +326,9 @@ func (s *session) handleSYN(streamID uint32, length int) error {
 	accepted.handshakeDone.Store(true)
 	s.streams[streamID] = accepted
 	s.streamAccess.Unlock()
+	if s.downlink != nil {
+		s.downlinkRearm.Store(true)
+	}
 	go s.service.acceptStream(s, accepted)
 	return nil
 }
@@ -374,6 +382,20 @@ func (s *session) handleSettings(length int) error {
 	buffer.Release()
 	s.settingsReceived = true
 	factory := s.padding.Load()
+	if s.downlink != nil {
+		// Both replies are already available. Emit them together without waiting
+		// for application data, preserving frame order and v1 compatibility.
+		var replies []controlFrame
+		if peerSettings[settingPaddingMD5] != factory.md5Sum && len(factory.rawScheme) <= maxFrameSize {
+			replies = append(replies, controlFrame{command: commandUpdatePaddingScheme, data: factory.rawScheme})
+		}
+		version, parseErr := strconv.Atoi(peerSettings[settingVersion])
+		if parseErr == nil && version >= protocolVersion {
+			s.peerVersion.Store(uint32(version))
+			replies = append(replies, controlFrame{command: commandServerSettings, data: settings{settingVersion: strconv.Itoa(protocolVersion)}.Bytes()})
+		}
+		return s.writeControlFrames(replies)
+	}
 	if peerSettings[settingPaddingMD5] != factory.md5Sum && len(factory.rawScheme) <= maxFrameSize {
 		err = s.writeFrame(commandUpdatePaddingScheme, 0, factory.rawScheme)
 		if err != nil {
@@ -535,19 +557,43 @@ func (s *session) writeData(target *stream, data []byte) (int, error) {
 }
 
 func (s *session) writeFrame(command byte, streamID uint32, data []byte) error {
-	if len(data) > maxFrameSize {
-		return E.New("anytls: control frame too large: ", len(data))
+	return s.writeControlFrames([]controlFrame{{command: command, streamID: streamID, data: data}})
+}
+
+type controlFrame struct {
+	command  byte
+	streamID uint32
+	data     []byte
+}
+
+func (s *session) writeControlFrames(frames []controlFrame) error {
+	if len(frames) == 0 {
+		return nil
 	}
-	frame := buf.NewSize(frameOverhead + len(data))
-	putFrameHeader(frame.Extend(frameOverhead), command, streamID, len(data))
-	common.Must1(frame.Write(data))
+	var size int
+	for _, frame := range frames {
+		if len(frame.data) > maxFrameSize {
+			return E.New("anytls: control frame too large: ", len(frame.data))
+		}
+		size += frameOverhead + len(frame.data)
+	}
+	frame := buf.NewSize(size)
+	for _, item := range frames {
+		putFrameHeader(frame.Extend(frameOverhead), item.command, item.streamID, len(item.data))
+		common.Must1(frame.Write(item.data))
+	}
 	s.conn.SetWriteDeadline(time.Now().Add(controlFrameWriteTimeout))
 	err := s.lockWrite()
 	if err != nil {
 		frame.Release()
 		return err
 	}
-	err = s.writeLocked(frame)
+	if s.downlink != nil {
+		err = s.writeDownlink(frame.Bytes(), true)
+		frame.Release()
+	} else {
+		err = s.writeLocked(frame)
+	}
 	if err == nil {
 		s.conn.SetWriteDeadline(time.Time{})
 	}
@@ -580,6 +626,9 @@ func (s *session) writeLocked(buffer *buf.Buffer) error {
 }
 
 func (s *session) writePacketLocked(data []byte) error {
+	if s.downlink != nil {
+		return s.writeDownlink(data, false)
+	}
 	if !s.sendPadding {
 		return common.Error(s.conn.Write(data))
 	}
@@ -633,4 +682,16 @@ func (s *session) writePacketLocked(data []byte) error {
 		return nil
 	}
 	return common.Error(s.conn.Write(data))
+}
+
+// Caller holds writeAccess. A new stream can reopen the shaping window but
+// cannot replenish the per-session padding budget.
+func (s *session) writeDownlink(data []byte, control bool) error {
+	if s.downlinkRearm.Swap(false) {
+		s.downlink.rearm()
+	}
+	if control {
+		return s.downlink.writeControl(s.conn, data)
+	}
+	return s.downlink.write(s.conn, data)
 }
