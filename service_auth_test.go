@@ -298,3 +298,78 @@ func TestAuthenticationOptionsAndAtomicUserValidation(t *testing.T) {
 	}
 	workers.Wait()
 }
+
+func TestAuthenticationShortTextRequestFallsBackImmediately(t *testing.T) {
+	t.Parallel()
+	for _, payload := range []string{"hello\r\n", "GET / HTTP/1.0\r\n\r\n", "GET / HTTP/1.1\r\n"} {
+		t.Run(strconv.Quote(payload), func(t *testing.T) {
+			t.Parallel()
+			got := make(chan []byte, 1)
+			service, err := NewService("password", ServiceOptions{
+				HandshakeTimeout: 10 * time.Second,
+				FallbackHandler: authFallbackFunc(func(conn net.Conn) {
+					defer conn.Close()
+					data := make([]byte, len(payload))
+					io.ReadFull(conn, data)
+					got <- data
+				}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			server, peer := net.Pipe()
+			defer peer.Close()
+			go service.NewConnection(context.Background(), server, M.Socksaddr{}, nil)
+			peer.SetDeadline(time.Now().Add(time.Second))
+			if _, err := peer.Write([]byte(payload)); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case data := <-got:
+				if string(data) != payload {
+					t.Fatalf("fallback got %q", data)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("short text request waited for the handshake timeout")
+			}
+		})
+	}
+}
+
+func TestAuthenticationShortNonTextWaits(t *testing.T) {
+	t.Parallel()
+	for _, payload := range [][]byte{[]byte("hi\n"), {0x5e, 0x88, 0x48, '\n'}, []byte("GET / HTTP/1.1")} {
+		service, err := NewService("password", ServiceOptions{HandshakeTimeout: 100 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		server, peer := net.Pipe()
+		result := make(chan error, 1)
+		go func() { result <- service.NewConnection(context.Background(), server, M.Socksaddr{}, nil) }()
+		peer.SetWriteDeadline(time.Now().Add(time.Second))
+		if _, err := peer.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+		if err := awaitAuthenticationResult(t, result); !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("%q: got %v, want deadline exceeded", payload, err)
+		}
+		peer.Close()
+	}
+}
+
+func TestIsTextRequestLine(t *testing.T) {
+	for data, want := range map[string]bool{
+		"hello\r\n":           true,
+		"GET / HTTP/1.0\r\n":  true,
+		"abc\n":               true,
+		"ab\r\n":              false,
+		"\r\n":                false,
+		"GET / HTTP/1.1":      false,
+		"GE\x00 / HTTP/1.1\n": false,
+		"\x16\x03\x01abc\n":   false,
+	} {
+		if got := isTextRequestLine([]byte(data)); got != want {
+			t.Errorf("%q: got %v, want %v", data, got, want)
+		}
+	}
+}

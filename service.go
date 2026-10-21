@@ -1,6 +1,7 @@
 package anytls
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -122,9 +123,14 @@ func (s *Service) handleConnection(ctx context.Context, conn net.Conn, source M.
 	})
 	buffer := buf.NewSize(passwordLen)
 	serveContext, authenticated, handshakeErr := func() (context.Context, bool, error) {
-		_, readErr := buffer.ReadFullFrom(conn, passwordLen)
-		if readErr != nil {
-			return nil, false, readErr
+		for !buffer.IsFull() {
+			_, readErr := buffer.ReadOnceFrom(conn)
+			if readErr != nil {
+				return nil, false, readErr
+			}
+			if !buffer.IsFull() && isTextRequestLine(buffer.Bytes()) {
+				return nil, false, errTextRequest
+			}
 		}
 		serveContext, authenticated := authenticate(buffer.Bytes())
 		if !authenticated {
@@ -179,6 +185,32 @@ func (s *Service) fallback(ctx context.Context, conn net.Conn, source M.Socksadd
 	}
 	s.fallbackHandler.NewConnectionEx(ctx, conn, source, M.Socksaddr{}, onClose)
 	return nil
+}
+
+var errTextRequest = E.New("anytls: short text request")
+
+// isTextRequestLine reports whether a partial verifier is already a complete
+// line of printable text, such as "GET / HTTP/1.0" or a junk probe. A web
+// server answers such a line at once, so it is handed to the fallback instead
+// of waiting for the handshake timeout. Only the shape of the bytes is
+// inspected, never the password. Clients write the verifier in one record;
+// a split digest that starts with three printable bytes and a newline is
+// still far too unlikely to matter.
+func isTextRequestLine(data []byte) bool {
+	end := bytes.IndexByte(data, '\n')
+	if end < 0 {
+		return false
+	}
+	line := bytes.TrimSuffix(data[:end], []byte{'\r'})
+	if len(line) < 3 {
+		return false
+	}
+	for _, c := range line {
+		if (c < 0x20 || c > 0x7e) && c != '\t' {
+			return false
+		}
+	}
+	return true
 }
 
 func readAuthenticationPadding(conn net.Conn) error {
